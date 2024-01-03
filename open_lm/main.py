@@ -17,6 +17,7 @@ from torch import optim
 from torch.cuda.amp import GradScaler
 
 import torch.distributed as dist
+import torch.distributed.checkpoint as dist_cp
 
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
@@ -28,6 +29,9 @@ from torch.distributed.fsdp import (
     CPUOffload,
 )
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+
+from torch.distributed.checkpoint.optimizer import load_sharded_optimizer_state_dict
+from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
 
 from open_lm.data import proc_token
 from open_lm.model import Block
@@ -154,7 +158,79 @@ def load_data_chunks(args):
         return [0 for _ in range(len(args.dataset_manifest))], 0
 
 
+
+def fsdp_save_checkpoint(rank, world_size, model, optim):
+
+    torch.cuda.set_device(rank)
+
+    # Create a model
+    #model_1, optim_1 = init_model()
+    #model = FSDP(model.cuda(rank)) 
+
+    # Save the model to CHECKPOINT_DIR
+    with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
+        state_dict = {
+            "model": model.state_dict(),
+            #"optim": FSDP.optim_state_dict(model, optim),
+        }
+
+        dist_cp.save_state_dict(
+            state_dict=state_dict,
+            #storage_writer=dist_cp.FileSystemWriter(args.checkpoint_path),
+            storage_writer=dist_cp.FileSystemWriter("./logs/checkpoint"),
+        )
+
+    # Shut down world pg
+    #dist.destroy_process_group()
+
+def fsdp_load_checkpoint(rank, world_size, args, model):
+
+    torch.cuda.set_device(rank)
+
+    # Load model_2 with parameters saved in CHECKPOINT_DIR
+    with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
+        state_dict = {
+            "model": model.state_dict(),
+            # cannot load the optimizer state_dict together with the model state_dict
+        }
+
+        dist_cp.load_state_dict(
+            state_dict=state_dict,
+            storage_reader=dist_cp.FileSystemReader("./logs/checkpoint"),
+        )
+        model.load_state_dict(state_dict["model"])
+
+
+    """
+    checkpoint = pt_load(args.resume, map_location="cpu")
+    if "epoch" in checkpoint:
+        # resuming a train checkpoint w/ epoch and optimizer state
+        start_epoch = checkpoint["epoch"]
+        sd = checkpoint["state_dict"]
+        global_step = checkpoint.get("step", None)
+        if next(iter(sd.items()))[0].startswith("module"):
+            sd = {k[len("module.") :]: v for k, v in sd.items()}
+        if args.fsdp:
+            model.load_state_dict(sd)
+        elif args.distributed:
+            model.module.load_state_dict(sd)
+        else:
+            model.load_state_dict(sd)
+        logging.info(f"=> resuming checkpoint '{args.resume}' (epoch {start_epoch})")
+    else:
+        # loading a bare (model only) checkpoint for fine-tune or evaluation
+        start_epoch, global_step = 0, 0
+        model.load_state_dict(checkpoint)
+        logging.info(f"=> loaded checkpoint '{args.resume}' (epoch {start_epoch})")
+    return start_epoch, global_step
+    """
+
+
+
+
 def save_checkpoint(
+    rank,
+    world_size,
     args,
     model,
     optimizer,
@@ -167,11 +243,24 @@ def save_checkpoint(
     samples_seen=None,
 ):
     cpu_state, optim_state = None, None
+
+    torch.cuda.set_device(rank)
+
+    # Initialize the process group
+    #dist.init_process_group("cpu:gloo,cuda:nccl", rank=rank, world_size=8)
+    #torch.cuda.set_device(rank)
+
     if args.logs and args.logs.lower() != "none" and args.fsdp:
-        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+        #save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
             cpu_state = model.state_dict()
             optim_state = FSDP.optim_state_dict(model, optimizer)
+
+        #save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        #with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+        #    cpu_state = model.state_dict()
+        #    optim_state = FSDP.optim_state_dict(model, optimizer)
+
     if args.save_logs:
         checkpoint_dict_model = {
             "epoch": completed_epoch,
@@ -219,16 +308,32 @@ def save_checkpoint(
             for prefix in prefixes:
                 path = os.path.join(args.checkpoint_path, f"{prefix}{completed_epoch}.pt")
                 print(f"Saving {prefix}{completed_epoch} in {path}...")
-                torch.save(
-                    prefixes[prefix],
-                    path,
-                )
+                #torch.save(
+                #    prefixes[prefix],
+                #    path,
+                #)
+                    # Save the model to CHECKPOINT_DIR
+                with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
+                    #state_dict = {
+                    #    "model": model_1.state_dict(),
+                    #    "optim": FSDP.optim_state_dict(model_1, optim_1),
+                    #}
+                    state_dict = prefixes
+
+                    dist_cp.save_state_dict(
+                        state_dict=state_dict,
+                        storage_writer=dist_cp.FileSystemWriter(args.checkpoint_path),
+                    )
+                    
 
         if args.delete_previous_checkpoint:
             for prefix in prefixes:
                 prev = os.path.join(args.checkpoint_path, f"{prefix}{completed_epoch - 1}.pt")
                 if os.path.exists(prev):
                     os.remove(prev)
+    
+    # Shut down world pg
+    dist.destroy_process_group()
 
 
 def check_args(args):
@@ -782,7 +887,63 @@ def main(args):
                     logging.warning("evaluation failed! continuing to save_checkpoint")
 
         # Saving checkpoints.
+        #save_checkpoint(
+        #    args,
+        #    model,
+        #    optimizer,
+        #    scaler,
+        #    epoch,
+        #    evaluation_metrics,
+        #    step=global_step,
+        #    is_final_checkpoint=done_training,
+        #    next_shard_per_source=next_shard_per_source if args.dataset_manifest is not None else None,
+        #    samples_seen=samples_seen if args.dataset_manifest is not None else None,
+        #)
+        import torch.multiprocessing as mp
+        import shutil
+
+        world_size = torch.cuda.device_count()
+
+        next_shard_per_source=next_shard_per_source if args.dataset_manifest is not None else None
+        samples_seen=samples_seen if args.dataset_manifest is not None else None
+
+        #save_args = (args, model, optimizer, scaler, epoch, evaluation_metrics, global_step, done_training, next_shard_per_source, samples_seen,)
+
+        #print(model.state_dict())
+        #run_fsdp_checkpoint_example(rank, args, model, optim, world_size):
+        #model = model._fsdp_wrapped_module
+        #print(model)
+        #wreck()
+        #wreck()
+        #import shutil
+        #shutil.rmtree(args.checkpoint_path, ignore_errors=True)
+
+        #torch.autograd.set_detect_anomaly(True)
+
+        #dist.init_process_group(backend="nccl")
+
+        world_size = torch.cuda.device_count()
+        #print(f"Running fsdp checkpoint example on {world_size} devices.")
+        #shutil.rmtree(CHECKPOINT_DIR, ignore_errors=True)
+
+        rank = dist.get_rank()
+        #model, optim = init_model()
+        import shutil
+        #shutil.rmtree(args.checkpoint_path, ignore_errors=True)
+
+        #run_fsdp_checkpoint_example(rank, world_size, model, optim)
+
+        print("Saving checkpoint...")
+        fsdp_save_checkpoint(rank, world_size, model, optim)
+        print("Loading checkpoint...")
+        fsdp_load_checkpoint(rank, world_size, args, model)
+        print("Checkpoint loaded!")
+        #dist.destroy_process_group()
+
+        """
         save_checkpoint(
+            rank,
+            world_size,
             args,
             model,
             optimizer,
@@ -794,6 +955,25 @@ def main(args):
             next_shard_per_source=next_shard_per_source if args.dataset_manifest is not None else None,
             samples_seen=samples_seen if args.dataset_manifest is not None else None,
         )
+        """
+
+        #world_size = torch.cuda.device_count()
+        #print(f"Running fsdp checkpoint example on {world_size} devices.")
+        #shutil.rmtree(args.checkpoint_path, ignore_errors=True)
+        #mp.spawn(
+        #    run_fsdp_checkpoint_example,
+        #    args=(world_size, model, optim),
+        #    nprocs=world_size,
+        #    join=True,
+        #)
+
+
+        #mp.spawn(
+        #    save_checkpoint,
+        #    args=save_args,
+        #    nprocs=world_size,
+        #    join=True,
+        #)
 
         if done_training:
             if is_master(args):
