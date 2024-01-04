@@ -103,6 +103,7 @@ def get_state_dict(name):
     return sd
 
 
+"""
 def load_model(args, model):
     checkpoint = pt_load(args.resume, map_location="cpu")
     if "epoch" in checkpoint:
@@ -125,7 +126,7 @@ def load_model(args, model):
         model.load_state_dict(checkpoint)
         logging.info(f"=> loaded checkpoint '{args.resume}' (epoch {start_epoch})")
     return start_epoch, global_step
-
+"""
 
 def load_optimizer(args, model, optimizer, scaler):
     potential_checkpoint = args.resume.replace("epoch_", "optimizer_")
@@ -159,29 +160,44 @@ def load_data_chunks(args):
 
 
 
-def fsdp_save_checkpoint(rank, world_size, model, optim):
+def load_model(rank, world_size, args, model):
 
     torch.cuda.set_device(rank)
 
-    # Create a model
-    #model_1, optim_1 = init_model()
-    #model = FSDP(model.cuda(rank)) 
+    if args.fsdp:
+        with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
+            state_dict = {
+                "model": model.state_dict(),
+                # cannot load the optimizer state_dict together with the model state_dict
+            }
 
-    # Save the model to CHECKPOINT_DIR
-    with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
-        state_dict = {
-            "model": model.state_dict(),
-            #"optim": FSDP.optim_state_dict(model, optim),
-        }
+            dist_cp.load_state_dict(
+                state_dict=state_dict,
+                storage_writer=dist_cp.FileSystemWriter(args.checkpoint_path),
+            )
+            model.load_state_dict(state_dict["model"])
 
-        dist_cp.save_state_dict(
-            state_dict=state_dict,
-            #storage_writer=dist_cp.FileSystemWriter(args.checkpoint_path),
-            storage_writer=dist_cp.FileSystemWriter("./logs/checkpoint"),
-        )
 
-    # Shut down world pg
-    #dist.destroy_process_group()
+    checkpoint = pt_load(args.resume, map_location="cpu")
+    if "epoch" in checkpoint:
+        # resuming a train checkpoint w/ epoch and optimizer state
+        start_epoch = checkpoint["epoch"]
+        sd = checkpoint["state_dict"]
+        global_step = checkpoint.get("step", None)
+        if next(iter(sd.items()))[0].startswith("module"):
+            sd = {k[len("module.") :]: v for k, v in sd.items()}
+
+        elif args.distributed:
+            model.module.load_state_dict(sd)
+        else:
+            model.load_state_dict(sd)
+        logging.info(f"=> resuming checkpoint '{args.resume}' (epoch {start_epoch})")
+    else:
+        # loading a bare (model only) checkpoint for fine-tune or evaluation
+        start_epoch, global_step = 0, 0
+        model.load_state_dict(checkpoint)
+        logging.info(f"=> loaded checkpoint '{args.resume}' (epoch {start_epoch})")
+    return start_epoch, global_step
 
 def fsdp_load_checkpoint(rank, world_size, args, model):
 
@@ -196,8 +212,9 @@ def fsdp_load_checkpoint(rank, world_size, args, model):
 
         dist_cp.load_state_dict(
             state_dict=state_dict,
-            storage_reader=dist_cp.FileSystemReader("./logs/checkpoint"),
+            storage_reader=dist_cp.FileSystemReader(args.checkpoint_path),
         )
+        #print(dist_cp.keys())
         model.load_state_dict(state_dict["model"])
 
 
@@ -226,7 +243,22 @@ def fsdp_load_checkpoint(rank, world_size, args, model):
     """
 
 
+def fsdp_save_checkpoint(rank, world_size, args, model, optim):
 
+    torch.cuda.set_device(rank)
+
+    with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
+        state_dict = {
+            "model": model.state_dict(),
+        }
+
+        dist_cp.save_state_dict(
+            state_dict=state_dict,
+            storage_writer=dist_cp.FileSystemWriter(args.checkpoint_path),
+        )
+
+    # Shut down world pg
+    #dist.destroy_process_group()
 
 def save_checkpoint(
     rank,
@@ -246,26 +278,30 @@ def save_checkpoint(
 
     torch.cuda.set_device(rank)
 
-    # Initialize the process group
-    #dist.init_process_group("cpu:gloo,cuda:nccl", rank=rank, world_size=8)
-    #torch.cuda.set_device(rank)
+    print(args.fsdp)
 
-    if args.logs and args.logs.lower() != "none" and args.fsdp:
-        #save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
-            cpu_state = model.state_dict()
-            optim_state = FSDP.optim_state_dict(model, optimizer)
+    #if args.fsdp:
+    #    with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
+    #        cpu_state = model.state_dict()
+    #        #state_dict = {
+    #        #    "model": model_state,
+            #}
 
-        #save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        #with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
-        #    cpu_state = model.state_dict()
-        #    optim_state = FSDP.optim_state_dict(model, optimizer)
+            #dist_cp.save_state_dict(
+            #    state_dict=state_dict,
+            #    storage_writer=dist_cp.FileSystemWriter(args.checkpoint_path),
+            #) 
 
+    #if args.logs and args.logs.lower() != "none" and args.fsdp:
+    #    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    #    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+    #        cpu_state = model.state_dict()
+    #        optim_state = FSDP.optim_state_dict(model, optimizer)
     if args.save_logs:
         checkpoint_dict_model = {
             "epoch": completed_epoch,
             "name": args.name,
-            "state_dict": cpu_state if args.fsdp else model.state_dict(),
+            "state_dict": None if args.fsdp else model.state_dict(),
             "evaluation_metrics": evaluation_metrics,
         }
         if next_shard_per_source is not None:
@@ -308,32 +344,42 @@ def save_checkpoint(
             for prefix in prefixes:
                 path = os.path.join(args.checkpoint_path, f"{prefix}{completed_epoch}.pt")
                 print(f"Saving {prefix}{completed_epoch} in {path}...")
-                #torch.save(
-                #    prefixes[prefix],
-                #    path,
-                #)
-                    # Save the model to CHECKPOINT_DIR
-                with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
-                    #state_dict = {
-                    #    "model": model_1.state_dict(),
-                    #    "optim": FSDP.optim_state_dict(model_1, optim_1),
-                    #}
-                    state_dict = prefixes
 
-                    dist_cp.save_state_dict(
-                        state_dict=state_dict,
-                        storage_writer=dist_cp.FileSystemWriter(args.checkpoint_path),
-                    )
-                    
+                if not args.fsdp:
+                    print("Wrong save...")
+                    #torch.save(
+                    #    prefixes[prefix],
+                    #    path,
+                    #)
+                else:
+                    with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
+                        #cpu_state = model.state_dict()
+                        #state_dict = {
+                        #    "model": cpu_state,
+                        #}
 
-        if args.delete_previous_checkpoint:
-            for prefix in prefixes:
-                prev = os.path.join(args.checkpoint_path, f"{prefix}{completed_epoch - 1}.pt")
-                if os.path.exists(prev):
-                    os.remove(prev)
-    
-    # Shut down world pg
-    dist.destroy_process_group()
+                        state_dict = {
+                            #"epoch": completed_epoch,
+                            #"name": args.name,
+                            "model": model.state_dict(),
+                            #"evaluation_metrics": evaluation_metrics,
+                        }
+
+                        dist_cp.save_state_dict(
+                                state_dict=state_dict,
+                                storage_writer=dist_cp.FileSystemWriter(args.checkpoint_path),
+                            )
+                        #dist_cp.save_state_dict(
+                        #    state_dict=prefixes[prefix],
+                        #    storage_writer=dist_cp.FileSystemWriter(path),
+                        #)
+
+        #if args.delete_previous_checkpoint:
+        #    for prefix in prefixes:
+        #        prev = os.path.join(args.checkpoint_path, f"{prefix}{completed_epoch - 1}.pt")
+        #        if os.path.exists(prev):
+        #            os.remove(prev)
+
 
 
 def check_args(args):
@@ -934,28 +980,33 @@ def main(args):
         #run_fsdp_checkpoint_example(rank, world_size, model, optim)
 
         print("Saving checkpoint...")
-        fsdp_save_checkpoint(rank, world_size, model, optim)
+        fsdp_save_checkpoint(rank, world_size, args, model, optim)
+
+     
+        #save_checkpoint(
+        #    rank,
+        #    world_size,
+        #    args,
+        #    model,
+        #    optimizer,
+        #    scaler,
+        #    epoch,
+        #    evaluation_metrics,
+        #    step=global_step,
+        #    is_final_checkpoint=done_training,
+        #    next_shard_per_source=next_shard_per_source if args.dataset_manifest is not None else None,
+        #    samples_seen=samples_seen if args.dataset_manifest is not None else None,
+        #)
+     
+
         print("Loading checkpoint...")
         fsdp_load_checkpoint(rank, world_size, args, model)
+        ##load_model(rank, world_size, args, model)
+        #start_epoch, global_step = load_model(rank, world_size, args, model)
+
         print("Checkpoint loaded!")
         #dist.destroy_process_group()
 
-        """
-        save_checkpoint(
-            rank,
-            world_size,
-            args,
-            model,
-            optimizer,
-            scaler,
-            epoch,
-            evaluation_metrics,
-            step=global_step,
-            is_final_checkpoint=done_training,
-            next_shard_per_source=next_shard_per_source if args.dataset_manifest is not None else None,
-            samples_seen=samples_seen if args.dataset_manifest is not None else None,
-        )
-        """
 
         #world_size = torch.cuda.device_count()
         #print(f"Running fsdp checkpoint example on {world_size} devices.")
