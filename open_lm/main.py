@@ -134,11 +134,17 @@ def load_data_chunks(args):
         return [0 for _ in range(len(args.dataset_manifest))], 0
 
 
+
+
 def load_model(args, model):
     start_epoch, global_step = 0, 0
 
     if args.sharded_state:
         torch.cuda.set_device(args.rank)
+
+        #print(args.checkpoint_path + "/stats_1.pt")
+        #metadata = torch.load(args.checkpoint_path + "/stats_1.pt")
+        #print(metadata['epoch'])
 
         # Load model_2 with parameters saved in CHECKPOINT_DIR
         with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
@@ -150,6 +156,19 @@ def load_model(args, model):
                 storage_reader=dist_cp.FileSystemReader(args.checkpoint_path),
             )
             model.load_state_dict(state_dict["state_dict"])
+    
+        # Load metadata
+        if args.rank == 0:
+            metadata_path = os.path.join(args.checkpoint_path, 'metadata.pth')
+            if os.path.exists(metadata_path):
+                with open(metadata_path, 'rb') as f:
+                    metadata = torch.load(f)
+                start_epoch = metadata.get('epoch')
+                name = metadata.get('name')
+                evaluation_metrics = metadata.get('evaluation_metrics')
+                samples_seen = metadata.get('samples_seen', None)
+                global_step = metadata.get('step', None)
+                
         return start_epoch, global_step
 
     checkpoint = pt_load(args.resume, map_location="cpu")
@@ -191,22 +210,34 @@ def save_checkpoint(
         torch.cuda.set_device(args.rank)
         with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
             checkpoint_dict_model = {
-                "epoch": completed_epoch,
-                "name": args.name,
+                #"epoch": completed_epoch,
+                #"name": args.name,
                 "state_dict": model.state_dict(),
-                "evaluation_metrics": evaluation_metrics,
+                #"evaluation_metrics": evaluation_metrics,
             }
 
-            if samples_seen is not None:
-                checkpoint_dict_model["samples_seen"] = samples_seen
-
-            # if step is not None:
-            #    checkpoint_dict_model["step"] = step
+            #if samples_seen is not None:
+            #    checkpoint_dict_model["samples_seen"] = samples_seen
 
             dist_cp.save_state_dict(
                 state_dict=checkpoint_dict_model,
                 storage_writer=dist_cp.FileSystemWriter(args.checkpoint_path),
             )
+        # Saving metadata separately
+        if args.rank == 0:  # Ensure only one process does this
+            metadata = {
+                "epoch": completed_epoch,
+                "name": args.name,
+                "evaluation_metrics": evaluation_metrics,
+            }
+            if samples_seen is not None:
+                metadata["samples_seen"] = samples_seen
+
+            if step is not None:
+                metadata["step"] = step
+
+            with open(os.path.join(args.checkpoint_path, 'metadata.pth'), 'wb') as f:
+                torch.save(metadata, f)
 
     cpu_state, optim_state = None, None
     if args.logs and args.logs.lower() != "none" and args.fsdp:
@@ -854,11 +885,11 @@ def main(args):
             samples_seen=samples_seen if args.dataset_manifest is not None else None,
         )
 
-        print("Loading checkpoint...")
+        #print("Loading checkpoint...")
 
         start_epoch, global_step = load_model(args, model)
 
-        print("Checkpoint loaded!")
+        #print("Checkpoint loaded!")
 
         if done_training:
             if is_master(args):
