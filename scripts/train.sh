@@ -1,0 +1,28 @@
+#/bin/sh
+torchrun --nproc_per_node=8 --master_port 49203 -m open_lm.main \
+    --train-num-samples 100000 \
+    --workers 2 \
+    --train-data "pipe:aws s3 cp s3://tri-ml-datasets/openlm/data/rpj_tokenized_upsampled_eleutherai/shard_{00000000..00099998}.tar -" "pipe:aws s3 cp s3://tri-ml-datasets/openlm/data/2T_no_rpj_tokenized_upsampled_25k_shard/shard_{00000000..00024998}.tar -" \
+    --train-data-mix-weights 0.725 0.275 \
+    --precision amp_bfloat16 \
+    --global-batch-size 8 \
+    --log-every-n-steps 1 \
+    --fsdp-pure-bf16 \
+    --lr 1e-3 \
+    --warmup 5000 \
+    --model open_lm_7b \
+    --wd 0.1 \
+    --beta2 0.95 \
+    --epochs 5 \
+    --grad-clip-norm 1 \
+    --name $RANDOM \
+    --seed 124 \
+    --data-key json \
+    --accum-freq 1 \
+    --model-norm default_layer_norm \
+    --ffn-type swiglu \
+    --fsdp \
+    --sharded-state \
+    --lr-cooldown-end 3e-3 \
+    --fsdp-limit-all-gathers \
+    --grad-checkpointing

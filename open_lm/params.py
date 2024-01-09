@@ -470,6 +470,12 @@ def parse_args(args):
         help="Use FullyShardedDataParallel for distributed training.",
     )
     parser.add_argument(
+        "--sharded-state",
+        default=False,
+        action="store_true",
+        help="Use SHARDED_STATE_DICT.",
+    )
+    parser.add_argument(
         "--fsdp-cpu-offload",
         default=False,
         action="store_true",
