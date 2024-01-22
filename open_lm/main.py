@@ -61,14 +61,17 @@ from open_lm.file_utils import (
     check_exists,
     start_sync_process,
     remote_sync,
+    remote_sync_from_s3,
     get_string_for_epoch,
     log_num_checkpoints,
     terminate_sync_process,
 )
 
+import warnings
+warnings.filterwarnings('ignore')
+
 
 LATEST_CHECKPOINT_NAME = "epoch_latest.pt"
-
 
 def random_seed(seed=42, rank=0):
     torch.manual_seed(seed + rank)
@@ -139,14 +142,20 @@ def load_data_chunks(args):
 def load_model(args, model):
     start_epoch, global_step = 0, 0
 
+    #checkpoint = pt_load(args.resume, map_location="cpu")
+    #remote_sync_from_s3("/tmp/checkpoints/34b_16x/checkpoints/", args.resume)
+    
     if args.sharded_state:
-        torch.cuda.set_device(args.rank)
+        #print(args.rank)
+        #torch.cuda.set_device(args.rank)
+        local_rank = args.rank % torch.cuda.device_count()
+        torch.cuda.set_device(local_rank)
 
         #print(args.checkpoint_path + "/stats_1.pt")
         #metadata = torch.load(args.checkpoint_path + "/stats_1.pt")
         #print(metadata['epoch'])
+        print("Loading state dict...")
 
-        # Load model_2 with parameters saved in CHECKPOINT_DIR
         with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
             state_dict = {
                 "state_dict": model.state_dict(),
@@ -159,7 +168,12 @@ def load_model(args, model):
     
         # Load metadata
         if args.rank == 0:
-            metadata_path = os.path.join(args.checkpoint_path, 'metadata.pth')
+            #print("Loaded state dict...")
+            if args.resume:
+                metadata_path = os.path.join(args.resume, 'metadata.pth')
+            else:
+                metadata_path = os.path.join(args.checkpoint_path, 'metadata.pth')
+            
             if os.path.exists(metadata_path):
                 with open(metadata_path, 'rb') as f:
                     metadata = torch.load(f)
@@ -207,7 +221,17 @@ def save_checkpoint(
     samples_seen=None,
 ):
     if args.sharded_state:
-        torch.cuda.set_device(args.rank)
+        #import glob
+        #print(glob.glob("/tmp/checkpoints/**", recursive=True))
+        #print(args.rank)
+
+        local_rank = args.rank % torch.cuda.device_count()
+        torch.cuda.set_device(local_rank)
+        # Is it only saving on one node.
+
+        #torch.cuda.set_device(args.rank)
+        node_checkpoint_path = os.path.join(args.checkpoint_path, f"node_{args.rank}")
+
         with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
             checkpoint_dict_model = {
                 #"epoch": completed_epoch,
@@ -215,13 +239,16 @@ def save_checkpoint(
                 "state_dict": model.state_dict(),
                 #"evaluation_metrics": evaluation_metrics,
             }
-
             #if samples_seen is not None:
             #    checkpoint_dict_model["samples_seen"] = samples_seen
+            print(args.rank)
 
             dist_cp.save_state_dict(
                 state_dict=checkpoint_dict_model,
-                storage_writer=dist_cp.FileSystemWriter(args.checkpoint_path),
+                #storage_writer=dist_cp.FileSystemWriter(args.checkpoint_path + "/" + str(args.rank) + "/" + str(args.local_rank)),
+                #storage_writer=dist_cp.FileSystemWriter(node_checkpoint_path),
+                #storage_writer=dist_cp.FileSystemWriter(node_checkpoint_path, thread_count=4),
+                storage_writer=dist_cp.FileSystemWriter(node_checkpoint_path, single_file_per_rank=False),
             )
         # Saving metadata separately
         if args.rank == 0:  # Ensure only one process does this
@@ -238,6 +265,9 @@ def save_checkpoint(
 
             with open(os.path.join(args.checkpoint_path, 'metadata.pth'), 'wb') as f:
                 torch.save(metadata, f)
+    
+    #import glob
+    #print(glob.glob("/tmp/checkpoints/**", recursive=True))
 
     cpu_state, optim_state = None, None
     if args.logs and args.logs.lower() != "none" and args.fsdp:
@@ -350,6 +380,8 @@ def cleanup(sync_process, distributed=False):
 
 
 def main(args):
+
+    import os
     args = parse_args(args)
 
     # Check the arg list for any incompatibilities.
@@ -428,7 +460,7 @@ def main(args):
     args.wandb = "wandb" in args.report_to or "all" in args.report_to
     args.tensorboard = "tensorboard" in args.report_to or "all" in args.report_to
     args.checkpoint_path = os.path.join(log_base_path, "checkpoints")
-    if is_master(args):
+    if is_master(args, local=args.log_local):
         args.tensorboard_path = os.path.join(log_base_path, "tensorboard") if args.tensorboard else ""
         for dirname in [args.tensorboard_path, args.checkpoint_path]:
             if dirname:
@@ -444,7 +476,7 @@ def main(args):
         if args.remote_sync is not None:
             checkpoint_path = os.path.join(args.remote_sync, args.name, "checkpoints")
 
-        if is_master(args):
+        if is_master(args, local=args.log_local):
             # Checking for existing checkpoint via master rank only. It is possible for
             # different rank processes to see different files if a shared file-system is under
             # stress, however it's very difficult to fully work around such situations.
@@ -471,8 +503,12 @@ def main(args):
 
     # start the sync proces if remote-sync is not None
     remote_sync_process = None
-    if is_master(args) and args.remote_sync is not None:
+    #if is_master(args) and args.remote_sync is not None:
+    #if is_master(args, local=args.log_local) and args.remote_sync is not None:
+    #if is_master(args, local=args.log_local) and args.remote_sync is not None:
+    if 0:
         # first make sure it works
+        print("Current rank: {}".format(args.rank))
         result = remote_sync(
             os.path.join(args.logs, args.name),
             os.path.join(args.remote_sync, args.name),
@@ -610,7 +646,7 @@ def main(args):
     if args.grad_checkpointing:
         model.set_grad_checkpointing()
 
-    if is_master(args):
+    if is_master(args,local=args.log_local):
         logging.info(f"Model (has {sum(p.numel() for p in model.parameters() if p.requires_grad)} parameters):")
         logging.info(f"{str(model)}")
         logging.info("Params:")
@@ -738,7 +774,7 @@ def main(args):
     if args.save_logs and args.tensorboard:
         assert tensorboard is not None, "Please install tensorboard."
         writer = tensorboard.SummaryWriter(args.tensorboard_path)
-    if args.wandb and is_master(args):
+    if args.wandb and is_master(args, local=args.log_local):
         assert wandb is not None, "Please install wandb."
         logging.debug("Starting wandb.")
 
@@ -765,7 +801,7 @@ def main(args):
 
         metrics = evaluate_loop(model, data["val_list"], start_epoch, args, writer)
 
-        if is_master(args):
+        if is_master(args, local=args.log_local):
             with fsspec.open(os.path.join(checkpoint_root, "results.jsonl"), "a") as f:
                 f.write(f"{json.dumps(metrics)}\n")
 
@@ -813,7 +849,7 @@ def main(args):
             )
 
         prev_step = global_step
-        if is_master(args):
+        if is_master(args, local=args.log_local):
             logging.info(f"=> epoch {epoch}, training on {args.train_data}")
 
         if args.distributed:
@@ -870,6 +906,28 @@ def main(args):
         samples_seen = samples_seen if args.dataset_manifest is not None else None
 
         print("Saving checkpoint...")
+        import glob
+        #print(glob.glob("/tmp/checkpoints/**", recursive=True))
+        #print(glob.glob("/opt/ml/**", recursive=True))
+
+        print(f"Running in distributed mode with multiple processes. Device: {args.device}.")
+        print(f"Process (global: {args.rank}, local {args.local_rank}), total {args.world_size}.")
+
+        def upload_to_s3(local_dir, s3_bucket):
+            """
+            Function to upload files from local directory to S3 bucket.
+            """
+            import subprocess
+            import time
+            try:
+                time.sleep(random.uniform(0, 10))  # Stagger up to 10 seconds
+                subprocess.run(
+                    ["aws", "s3", "sync", local_dir, s3_bucket],
+                    check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                )
+                print(f"Node {args.rank} successfully uploaded data to {s3_bucket}")
+            except subprocess.CalledProcessError as e:
+                print(f"Failed to upload from Node {args.rank}: {e.stderr.decode()}")
 
         # Saving checkpoints.
         save_checkpoint(
@@ -885,22 +943,37 @@ def main(args):
             samples_seen=samples_seen if args.dataset_manifest is not None else None,
         )
 
+        print(glob.glob("/tmp/checkpoints/**", recursive=True))
+        print(os.path.join(args.logs, args.name))
+        #wreck()
+
+        #result = remote_sync(os.path.join(args.logs, args.name), os.path.join(args.remote_sync, args.name),args.remote_sync_protocol)
+        #if result:
+        #    print("Final remote sync successful.")
+        #else:
+        #    print("Final remote sync failed.")
+
         #print("Loading checkpoint...")
-
-        start_epoch, global_step = load_model(args, model)
-
+        #start_epoch, global_step = load_model(args, model)
         #print("Checkpoint loaded!")
 
         if done_training:
-            if is_master(args):
+            if is_master(args, local=args.log_local):
                 logging.info("Model has seen the desired number of tokens. Ending training.")
             break
 
-    if args.wandb and is_master(args):
+    # a brute force attempt to upload
+    #if args.rank % 8 == 0:
+    if 0:
+        upload_to_s3(os.path.join(args.logs, args.name), os.path.join(args.remote_sync, args.name))
+        
+    if args.wandb and is_master(args, local=args.log_local):
         wandb.finish()
 
     # run a final sync.
-    if remote_sync_process is not None:
+    if 0:
+    #if remote_sync_process is not None:
+        print(os.path.join(args.logs, args.name), flush=True)
         logging.info("Final remote sync.")
         terminate_sync_process(remote_sync_process)
         result = remote_sync(
@@ -912,6 +985,8 @@ def main(args):
             logging.info("Final remote sync successful.")
         else:
             logging.info("Final remote sync failed.")
+
+    # Igor: maybe this is killing multi-node sync?
     cleanup(remote_sync_process, args.distributed)
 
     return args
