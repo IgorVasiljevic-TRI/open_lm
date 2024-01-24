@@ -28,6 +28,8 @@ from torch.distributed.fsdp import (
     CPUOffload,
 )
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.distributed.checkpoint.optimizer import load_sharded_optimizer_state_dict
+from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
 
 from open_lm.data import proc_token
 from open_lm.model import Block
@@ -180,8 +182,41 @@ def save_checkpoint(
     samples_seen=None,
     shard_shuffle_seed=None,
 ):
+
+    if args.sharded_state:
+  
+        local_rank = args.rank % torch.cuda.device_count()
+        torch.cuda.set_device(local_rank)
+
+        node_checkpoint_path = os.path.join(args.checkpoint_path, f"gpu_{args.rank}")
+
+        with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
+            checkpoint_dict_model = {
+                "state_dict": model.state_dict(),
+            }
+
+            dist_cp.save_state_dict(
+                state_dict=checkpoint_dict_model,
+                storage_writer=dist_cp.FileSystemWriter(node_checkpoint_path),
+            )
+        # Saving metadata separately
+        if args.rank == 0:  # Ensure only one process does this
+            metadata = {
+                "epoch": completed_epoch,
+                "name": args.name,
+                "evaluation_metrics": evaluation_metrics,
+            }
+            if samples_seen is not None:
+                metadata["samples_seen"] = samples_seen
+
+            if step is not None:
+                metadata["step"] = step
+
+            with open(os.path.join(args.checkpoint_path, '.metadata'), 'wb') as f:
+                torch.save(metadata, f)
+
     cpu_state, optim_state = None, None
-    if args.logs and args.logs.lower() != "none" and args.fsdp:
+    if args.logs and args.logs.lower() != "none" and args.fsdp and not args.sharded_state:
         save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
         with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
             cpu_state = model.state_dict()
@@ -222,11 +257,18 @@ def save_checkpoint(
             "evaluation_metrics": evaluation_metrics,
         }
 
-        prefixes = {
-            "epoch_": checkpoint_dict_model,
-            "optimizer_": checkpoint_dict_opt,
-            "stats_": checkpoint_dict_stats,
-        }
+        if args.sharded_state:
+            prefixes = {
+                "optimizer_": checkpoint_dict_opt,
+                "stats_": checkpoint_dict_stats,
+            }
+
+        else:
+            prefixes = {
+                "epoch_": checkpoint_dict_model,
+                "optimizer_": checkpoint_dict_opt,
+                "stats_": checkpoint_dict_stats,
+            }
 
         if (
             completed_epoch == args.epochs
