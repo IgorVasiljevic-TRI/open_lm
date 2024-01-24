@@ -688,6 +688,7 @@ def main(args):
 
     # determine if this worker should save logs and checkpoints. only do so if it is rank == 0
     args.save_logs = args.logs and args.logs.lower() != "none" and is_master(args)
+    #args.save_logs = args.logs and args.logs.lower() != "none" and is_master(args,local=args.log_local)
     writer = None
     if args.save_logs and args.tensorboard:
         assert tensorboard is not None, "Please install tensorboard."
@@ -845,6 +846,10 @@ def main(args):
                 logging.info("Model has seen the desired number of tokens. Ending training.")
             break
 
+    # a brute force attempt to upload, assume 8 gpus per node
+    if args.rank % 8 == 0:
+        upload_to_s3(args, os.path.join(args.logs, args.name), os.path.join(args.remote_sync, args.name))
+
     if args.wandb and is_master(args):
         wandb.finish()
 
@@ -866,6 +871,22 @@ def main(args):
     return args
 
 
+def upload_to_s3(args, local_dir, s3_bucket):
+    """
+    Function to upload files from local directory to S3 bucket.
+    """
+    import subprocess
+    import time
+    try:
+        time.sleep(random.uniform(0, 10))  # Stagger up to 10 seconds
+        subprocess.run(
+            ["aws", "s3", "sync", local_dir, s3_bucket],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        print(f"Node {args.rank} successfully uploaded data to {s3_bucket}")
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to upload from Node {args.rank}: {e.stderr.decode()}")
+        
 def copy_codebase(args):
     from shutil import copytree, ignore_patterns
 
