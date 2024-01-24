@@ -58,6 +58,9 @@ from open_lm.scheduler import cosine_lr
 from open_lm.train import train_one_epoch, evaluate_loop
 from open_lm.file_utils import (
     pt_load,
+    pt_load2,
+    _pt_load_s3_cp,
+    remote_cp_from_s3,
     check_exists,
     start_sync_process,
     remote_sync,
@@ -138,12 +141,54 @@ def load_data_chunks(args):
 
 
 
+import subprocess
+import os
+
+def _pt_load_s3_cp(folder_s3_path, local_dir, map_location=None):
+    #os.makedirs(local_dir, exist_ok=True)
+
+    cmd_list = f"aws s3 ls {folder_s3_path} --recursive"
+    proc_list = subprocess.Popen(cmd_list, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout_list, stderr_list = proc_list.communicate()
+
+    if proc_list.returncode != 0:
+        raise Exception(f"Failed to list files from s3. stderr: {stderr_list.decode()}")
+
+    file_paths = [line.split()[-1] for line in stdout_list.decode().splitlines()]
+
+    for file_path in file_paths:
+        # Extract just the file name from the path
+        file_name = file_path.split('/')[-1]
+        s3_file_path = f"{folder_s3_path}{file_name}"
+        local_file_path = os.path.join(local_dir, file_name)
+
+        cmd_cp = f"aws s3 cp {s3_file_path} {local_file_path}"
+        proc_cp = subprocess.Popen(cmd_cp, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        _, stderr_cp = proc_cp.communicate()
+
+        if proc_cp.returncode != 0:
+            raise Exception(f"Failed to download file from s3. File: {s3_file_path}. stderr: {stderr_cp.decode()}")
+
+    print("All files downloaded successfully.")
+
+
 
 def load_model(args, model):
     start_epoch, global_step = 0, 0
 
-    #checkpoint = pt_load(args.resume, map_location="cpu")
-    #remote_sync_from_s3("/tmp/checkpoints/34b_16x/checkpoints/", args.resume)
+    import glob
+    #print(glob.glob("/tmp/checkpoints/**", recursive=True))
+    #checkpoint = pt_load2(args.resume, map_location="cpu")
+    #remote_cp_from_s3("/tmp/checkpoints/open_lm_160m2/checkpoints/", "s3://tri-ml-datasets/openlm/tri/checkpoints/open_lm_160m2/checkpoints/.metadata")
+    #remote_sync_from_s3("/tmp/checkpoints/open_lm_160m2/checkpoints/", args.resume)
+
+    #remote_cp_from_s3("/tmp/checkpoints/open_lm_34b_test/checkpoints/", "s3://tri-ml-datasets/openlm/tri/checkpoints/open_lm_34b_test/checkpoints/.metadata")
+    #remote_sync_from_s3("/tmp/checkpoints/open_lm_34b_test/checkpoints/", "s3://tri-ml-datasets/openlm/tri/checkpoints/34b_tmp/")
+    _pt_load_s3_cp("s3://tri-ml-datasets/openlm/tri/checkpoints/34b_tmp/","/tmp/checkpoints/open_lm_34b_test/checkpoints/")
+
+    print(glob.glob("/tmp/checkpoints/**", recursive=True))
+    #remote_sync_from_s3(args.logs, args.resume)
+    #remote_sync_from_s3(args.resume, args.logs)
     
     if args.sharded_state:
         #print(args.rank)
@@ -230,7 +275,7 @@ def save_checkpoint(
         # Is it only saving on one node.
 
         #torch.cuda.set_device(args.rank)
-        node_checkpoint_path = os.path.join(args.checkpoint_path, f"node_{args.rank}")
+        node_checkpoint_path = os.path.join(args.checkpoint_path, f"gpu_{args.rank}")
 
         with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
             checkpoint_dict_model = {
@@ -246,9 +291,9 @@ def save_checkpoint(
             dist_cp.save_state_dict(
                 state_dict=checkpoint_dict_model,
                 #storage_writer=dist_cp.FileSystemWriter(args.checkpoint_path + "/" + str(args.rank) + "/" + str(args.local_rank)),
-                #storage_writer=dist_cp.FileSystemWriter(node_checkpoint_path),
+                storage_writer=dist_cp.FileSystemWriter(node_checkpoint_path),
                 #storage_writer=dist_cp.FileSystemWriter(node_checkpoint_path, thread_count=4),
-                storage_writer=dist_cp.FileSystemWriter(node_checkpoint_path, single_file_per_rank=False),
+                #storage_wrditer=dist_cp.FileSystemWriter(node_checkpoint_path, single_file_per_rank=False),
             )
         # Saving metadata separately
         if args.rank == 0:  # Ensure only one process does this
@@ -263,14 +308,16 @@ def save_checkpoint(
             if step is not None:
                 metadata["step"] = step
 
-            with open(os.path.join(args.checkpoint_path, 'metadata.pth'), 'wb') as f:
+            #with open(os.path.join(args.checkpoint_path, 'metadata.pth'), 'wb') as f:
+            with open(os.path.join(args.checkpoint_path, '.metadata'), 'wb') as f:
                 torch.save(metadata, f)
     
     #import glob
     #print(glob.glob("/tmp/checkpoints/**", recursive=True))
 
     cpu_state, optim_state = None, None
-    if args.logs and args.logs.lower() != "none" and args.fsdp:
+    #if args.logs and args.logs.lower() != "none" and args.fsdp:
+    if 0:
         save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
         with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
             cpu_state = model.state_dict()
@@ -505,8 +552,7 @@ def main(args):
     remote_sync_process = None
     #if is_master(args) and args.remote_sync is not None:
     #if is_master(args, local=args.log_local) and args.remote_sync is not None:
-    #if is_master(args, local=args.log_local) and args.remote_sync is not None:
-    if 0:
+    if is_master(args, local=args.log_local) and args.remote_sync is not None:
         # first make sure it works
         print("Current rank: {}".format(args.rank))
         result = remote_sync(
@@ -660,6 +706,7 @@ def main(args):
     # optionally resume model from a checkpoint
     start_epoch, global_step = 0, 0
     if args.resume is not None:
+        print(os.path.join(args.logs, args.name))
         start_epoch, global_step = load_model(args, model)
     elif args.pretrained is not None:
         print("=> loading from a pre-trained model.")
@@ -963,16 +1010,15 @@ def main(args):
             break
 
     # a brute force attempt to upload
-    #if args.rank % 8 == 0:
-    if 0:
+    if args.rank % 8 == 0:
         upload_to_s3(os.path.join(args.logs, args.name), os.path.join(args.remote_sync, args.name))
         
     if args.wandb and is_master(args, local=args.log_local):
         wandb.finish()
 
     # run a final sync.
-    if 0:
-    #if remote_sync_process is not None:
+    #if 0:
+    if remote_sync_process is not None:
         print(os.path.join(args.logs, args.name), flush=True)
         logging.info("Final remote sync.")
         terminate_sync_process(remote_sync_process)

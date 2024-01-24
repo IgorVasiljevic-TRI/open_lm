@@ -12,6 +12,7 @@ from itertools import cycle, islice
 import fsspec
 import numpy as np
 import torch
+import boto3
 
 from typing import List, Optional
 from tqdm import tqdm
@@ -19,10 +20,103 @@ from tqdm import tqdm
 from open_lm.distributed import is_master
 
 
+def remote_cp_from_s3(local_dir, remote_dir):
+    # skip epoch_latest which can change during sync.
+    result = subprocess.run(
+        ["aws", "s3", "cp", remote_dir, local_dir, "--exclude", "*epoch_latest.pt", "--debug"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        logging.error(f"Error: Failed to sync with S3 bucket {result.stderr.decode('utf-8')}")
+        return False
+
+    logging.info(f"Successfully synced with S3 bucket")
+    return True
+
+def remote_sync_from_s3(local_dir, remote_dir):
+    # skip epoch_latest which can change during sync.
+    result = subprocess.run(
+        ["aws", "s3", "sync", remote_dir, local_dir, "--exclude", "*epoch_latest.pt", "--debug"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        logging.error(f"Error: Failed to sync with S3 bucket {result.stderr.decode('utf-8')}")
+        return False
+
+    logging.info(f"Successfully synced with S3 bucket")
+    return True
+
+
+import subprocess
+import logging
+import os
+import shutil
+from pathlib import Path
+
+def _remote_sync_from_s3(local_dir, remote_dir):
+    # Sync the entire directory structure from S3
+    result = subprocess.run(
+        ["aws", "s3", "sync", remote_dir, local_dir, "--exclude", "*epoch_latest.pt", "--debug"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        logging.error(f"Error: Failed to sync with S3 bucket {result.stderr.decode('utf-8')}")
+        return False
+
+    # Reorganize files locally
+    try:
+        for subdir, dirs, files in os.walk(local_dir):
+            for file in files:
+                if file.endswith('.distcp'):
+                    old_file_path = os.path.join(subdir, file)
+                    new_file_path = os.path.join(local_dir, file)
+                    shutil.move(old_file_path, new_file_path)
+
+        # Optionally, clean up empty directories
+        for subdir in Path(local_dir).glob('**/*'):
+            if subdir.is_dir() and not any(subdir.iterdir()):
+                subdir.rmdir()
+
+        logging.info("Successfully synced and reorganized files from S3 bucket")
+        return True
+    except Exception as e:
+        logging.error(f"Error during file reorganization: {str(e)}")
+        return False
+
+"""
+def remote_sync_from_s3(local_dir, remote_dir):
+    s3 = boto3.client('s3')
+    bucket_name = remote_dir.split('/')[2]
+    remote_path = '/'.join(remote_dir.split('/')[3:])
+
+    # List all objects in the S3 directory
+    paginator = s3.get_paginator('list_objects_v2')
+    for page in paginator.paginate(Bucket=bucket_name, Prefix=remote_path):
+        for obj in page.get('Contents', []):
+            file_name = obj['Key'].split('/')[-1]
+            if 'epoch_latest.pt' in file_name:
+                continue  # Skip the file
+            s3_file_path = f's3://{bucket_name}/{obj["Key"]}'
+            local_file_path = f'{local_dir}/{file_name}'
+            result = subprocess.run(
+                ["aws", "s3", "cp", s3_file_path, local_file_path, "--debug"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if result.returncode != 0:
+                logging.error(f"Error: Failed to sync {file_name} from S3 bucket {result.stderr.decode('utf-8')}")
+                return False
+
+    logging.info("Successfully synced with S3 bucket")
+    return True
+"""
 def remote_sync_s3(local_dir, remote_dir):
     # skip epoch_latest which can change during sync.
     result = subprocess.run(
-        ["aws", "s3", "sync", local_dir, remote_dir, "--exclude", "*epoch_latest.pt"],
+        ["aws", "s3", "sync", local_dir, remote_dir, "--exclude", "*epoch_latest.pt", "--debug"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -97,6 +191,16 @@ def pt_save(pt_obj, file_path):
         torch.save(pt_obj, file_path)
 
 
+
+def _pt_load_s3_sync(file_path, map_location=None):
+    cmd = f"aws s3 sync {file_path} -"
+    proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout, stderr = proc.communicate()
+    if proc.returncode != 0:
+        raise Exception(f"Failed to fetch model from s3. stderr: {stderr.decode()}")
+    return torch.load(io.BytesIO(stdout), map_location=map_location)
+
+
 def _pt_load_s3_cp(file_path, map_location=None):
     cmd = f"aws s3 cp {file_path} -"
     proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -104,6 +208,17 @@ def _pt_load_s3_cp(file_path, map_location=None):
     if proc.returncode != 0:
         raise Exception(f"Failed to fetch model from s3. stderr: {stderr.decode()}")
     return torch.load(io.BytesIO(stdout), map_location=map_location)
+
+
+
+def pt_load2(file_path, map_location=None):
+    if file_path.startswith("s3"):
+        logging.info("Loading remote checkpoint, which may take a bit.")
+        return _pt_load_s3_sync(file_path, map_location)
+    #of = fsspec.open(file_path, "rb")
+    #with of as f:
+    #    out = torch.load(f, map_location=map_location)
+    #return out
 
 
 def pt_load(file_path, map_location=None):
