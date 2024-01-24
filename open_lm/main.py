@@ -17,6 +17,7 @@ from torch import optim
 from torch.cuda.amp import GradScaler
 
 import torch.distributed as dist
+import torch.distributed.checkpoint as dist_cp
 
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
@@ -373,7 +374,7 @@ def main(args):
     args.wandb = "wandb" in args.report_to or "all" in args.report_to
     args.tensorboard = "tensorboard" in args.report_to or "all" in args.report_to
     args.checkpoint_path = os.path.join(log_base_path, "checkpoints")
-    if is_master(args):
+    if is_master(args, local=args.log_local):
         args.tensorboard_path = os.path.join(log_base_path, "tensorboard") if args.tensorboard else ""
         for dirname in [args.tensorboard_path, args.checkpoint_path]:
             if dirname:
@@ -389,7 +390,7 @@ def main(args):
         if args.remote_sync is not None:
             checkpoint_path = os.path.join(args.remote_sync, args.name, "checkpoints")
 
-        if is_master(args):
+        if is_master(args, local=args.log_local):
             # Checking for existing checkpoint via master rank only. It is possible for
             # different rank processes to see different files if a shared file-system is under
             # stress, however it's very difficult to fully work around such situations.
@@ -416,7 +417,7 @@ def main(args):
 
     # start the sync proces if remote-sync is not None
     remote_sync_process = None
-    if is_master(args) and args.remote_sync is not None:
+    if is_master(args, local=args.log_local) and args.remote_sync is not None:
         # first make sure it works
         result = remote_sync(
             os.path.join(args.logs, args.name),
@@ -691,7 +692,7 @@ def main(args):
     if args.save_logs and args.tensorboard:
         assert tensorboard is not None, "Please install tensorboard."
         writer = tensorboard.SummaryWriter(args.tensorboard_path)
-    if args.wandb and is_master(args):
+    if args.wandb and is_master(args, local=args.log_local):
         assert wandb is not None, "Please install wandb."
         logging.debug("Starting wandb.")
 
@@ -840,7 +841,7 @@ def main(args):
         )
 
         if done_training:
-            if is_master(args):
+            if is_master(args, local=args.log_local):
                 logging.info("Model has seen the desired number of tokens. Ending training.")
             break
 
